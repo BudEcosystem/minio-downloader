@@ -70,36 +70,53 @@ def download_folder(
     # Set up progress tracking
     total_files = len(download_files)
     completed_files = 0
+    total_size = 0
+    completed_size = 0
     lock = threading.Lock()
     start_time = time.time()
 
+    # Get total size of all files
+    for file_info in download_files:
+        try:
+            stat = client.stat_object(bucket_name, file_info['object_name'])
+            file_info['size'] = stat.size
+            total_size += stat.size
+        except S3Error as err:
+            print(f"Error getting size for {file_info['object_name']}: {err}")
+            return False
+
     progress_configmap = {
         "total_files": str(total_files),
-        "completed_files": str(completed_files),
+        "completed_files": "0",
+        "total_size": str(total_size),
+        "completed_size": "0",
         "eta": "",
         "status": "downloading"
     }
 
     def download_file(file_info):
-        nonlocal completed_files
+        nonlocal completed_files, completed_size
         try:
             client.fget_object(bucket_name, file_info['object_name'], file_info['file_path'])
 
             with lock:
                 completed_files += 1
+                completed_size += file_info['size']
                 elapsed_time = time.time() - start_time
-                files_per_second = completed_files / elapsed_time if elapsed_time > 0 else 0
-                remaining_files = total_files - completed_files
-                eta_seconds = remaining_files / files_per_second if files_per_second > 0 else 0
+                bytes_per_second = completed_size / elapsed_time if elapsed_time > 0 else 0
+                remaining_size = total_size - completed_size
+                eta_seconds = remaining_size / bytes_per_second if bytes_per_second > 0 else 0
 
                 eta_min = int(eta_seconds // 60)
                 eta_sec = int(eta_seconds % 60)
 
-                print(f"Progress: {completed_files}/{total_files} files " 
-                      f"({(completed_files/total_files)*100:.1f}%) - "
+                print(f"Progress: {completed_files}/{total_files} files "
+                      f"({(completed_size/total_size)*100:.1f}%) - "
                       f"ETA: {eta_min}m {eta_sec}s - "
                       f"Downloaded: {file_info['object_name']}")
+                
                 progress_configmap["completed_files"] = str(completed_files)
+                progress_configmap["completed_size"] = str(completed_size)
                 progress_configmap["eta"] = str(eta_seconds)
                 update_status(progress_configmap)
             return True
@@ -166,18 +183,32 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
     # Set up progress tracking
     total_files = len(upload_files)
     completed_files = 0
+    total_size = 0
+    completed_size = 0
     lock = threading.Lock()
     start_time = time.time()
 
+    # Get total size of all files
+    for file_info in upload_files:
+        try:
+            file_size = os.path.getsize(file_info['file_path'])
+            file_info['size'] = file_size
+            total_size += file_size
+        except OSError as err:
+            print(f"Error getting size for {file_info['file_path']}: {err}")
+            return False
+
     progress_configmap = {
         "total_files": str(total_files),
-        "completed_files": str(completed_files),
+        "completed_files": "0",
+        "total_size": str(total_size),
+        "completed_size": "0",
         "eta": "",
         "status": "uploading"
     }
     
     def upload_file(file_info):
-        nonlocal completed_files
+        nonlocal completed_files, completed_size
         try:
             client.fput_object(
                 bucket_name, 
@@ -187,19 +218,22 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
             
             with lock:
                 completed_files += 1
+                completed_size += file_info['size']
                 elapsed_time = time.time() - start_time
-                files_per_second = completed_files / elapsed_time if elapsed_time > 0 else 0
-                remaining_files = total_files - completed_files
-                eta_seconds = remaining_files / files_per_second if files_per_second > 0 else 0
+                bytes_per_second = completed_size / elapsed_time if elapsed_time > 0 else 0
+                remaining_size = total_size - completed_size
+                eta_seconds = remaining_size / bytes_per_second if bytes_per_second > 0 else 0
                 
                 eta_min = int(eta_seconds // 60)
                 eta_sec = int(eta_seconds % 60)
                 
-                print(f"Progress: {completed_files}/{total_files} files " 
-                      f"({(completed_files/total_files)*100:.1f}%) - "
+                print(f"Progress: {completed_files}/{total_files} files "
+                      f"({(completed_size/total_size)*100:.1f}%) - "
                       f"ETA: {eta_min}m {eta_sec}s - "
                       f"Uploaded: {file_info['object_name']}")
+                
                 progress_configmap["completed_files"] = str(completed_files)
+                progress_configmap["completed_size"] = str(completed_size)
                 progress_configmap["eta"] = str(eta_seconds)
                 update_status(progress_configmap)
             return True
