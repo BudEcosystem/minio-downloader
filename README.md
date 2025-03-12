@@ -33,3 +33,11 @@ python main.py --operation download --model-path models/ --local-path /data/mode
 - `MINIO_SECRET_KEY`: The MinIO secret key.
 
 - `MINIO_BUCKET`: The MinIO bucket name. Defaults to "models" if not set.
+
+
+## Docker
+
+```bash
+docker build -t minio-downloader .
+docker run -e MINIO_ENDPOINT=minio.example.com -e MINIO_ACCESS_KEY=minio -e MINIO_SECRET_KEY=minio123 -e MINIO_BUCKET=models -v /data/models-registry:/data/models-registry minio-downloader --operation download --model-path models/ --local-path /data/models-registry
+```
