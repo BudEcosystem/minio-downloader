@@ -44,6 +44,9 @@ def update_status(configmap: dict):
     namespace = os.environ.get("NAMESPACE")
     configmap_name = os.environ.get("CONFIGMAP_NAME")
     use_kubernetes = os.environ.get("USE_KUBERNETES")
+    print(f"namespace: {namespace}")
+    print(f"configmap_name: {configmap_name}")
+    print(f"use_kubernetes: {use_kubernetes}")
     if use_kubernetes == "True":
         create_or_update_configmap(configmap, namespace, configmap_name)
     else:

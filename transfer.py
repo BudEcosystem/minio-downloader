@@ -74,8 +74,8 @@ def download_folder(
     start_time = time.time()
 
     progress_configmap = {
-        "total_files": total_files,
-        "completed_files": completed_files,
+        "total_files": str(total_files),
+        "completed_files": str(completed_files),
         "eta": "",
         "status": "downloading"
     }
@@ -99,8 +99,8 @@ def download_folder(
                       f"({(completed_files/total_files)*100:.1f}%) - "
                       f"ETA: {eta_min}m {eta_sec}s - "
                       f"Downloaded: {file_info['object_name']}")
-                progress_configmap["completed_files"] = completed_files
-                progress_configmap["eta"] = eta_seconds
+                progress_configmap["completed_files"] = str(completed_files)
+                progress_configmap["eta"] = str(eta_seconds)
                 update_status(progress_configmap)
             return True
         except S3Error as err:
@@ -170,8 +170,8 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
     start_time = time.time()
 
     progress_configmap = {
-        "total_files": total_files,
-        "completed_files": completed_files,
+        "total_files": str(total_files),
+        "completed_files": str(completed_files),
         "eta": "",
         "status": "uploading"
     }
@@ -199,8 +199,8 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
                       f"({(completed_files/total_files)*100:.1f}%) - "
                       f"ETA: {eta_min}m {eta_sec}s - "
                       f"Uploaded: {file_info['object_name']}")
-                progress_configmap["completed_files"] = completed_files
-                progress_configmap["eta"] = eta_seconds
+                progress_configmap["completed_files"] = str(completed_files)
+                progress_configmap["eta"] = str(eta_seconds)
                 update_status(progress_configmap)
             return True
         except S3Error as err:

@@ -36,7 +36,7 @@ def main(args):
         download_folder(client, bucket_name, prefix, local_destination)
     elif args.operation == "upload":
         # Upload everything under `local_destination` to `prefix` in `bucket_name`
-        upload_folder(client, bucket_name, prefix, local_destination, args.use_kubernetes, args.namespace, args.configmap_name)
+        upload_folder(client, bucket_name, prefix, local_destination)
 
 
 if __name__ == "__main__":
