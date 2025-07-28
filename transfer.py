@@ -5,8 +5,120 @@ from minio.error import S3Error
 from typing import List
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from collections import deque
+from datetime import datetime
 
 from status import update_status
+
+
+class ProgressCallback(threading.Thread):
+    """Progress callback for MinIO file operations."""
+    
+    def __init__(self, transfer_progress, file_id):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.transfer_progress = transfer_progress
+        self.file_id = file_id
+        self.total_length = 0
+        self.current_size = 0
+        
+    def set_meta(self, total_length, object_name):
+        """Called by MinIO client to set file metadata."""
+        self.total_length = total_length
+        self.object_name = object_name
+        self.transfer_progress.start_file(self.file_id, total_length)
+        
+    def update(self, size):
+        """Called by MinIO client to update progress."""
+        self.current_size += size
+        self.transfer_progress.update_file(self.file_id, self.current_size)
+        
+    def run(self):
+        """Thread run method (required by MinIO client)."""
+        pass
+
+
+class TransferProgress:
+    """Track progress for parallel file transfers with accurate ETA calculation."""
+    
+    def __init__(self, total_files, total_size):
+        self.total_files = total_files
+        self.total_size = total_size
+        self.completed_files = 0
+        self.completed_size = 0
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        
+        # Track progress for each file
+        self.file_progress = {}
+        
+        # Rolling window for speed calculation (last 10 updates)
+        self.speed_samples = deque(maxlen=10)
+        self.last_update_time = self.start_time
+        
+    def start_file(self, file_id, file_size):
+        """Mark a file as started."""
+        with self.lock:
+            self.file_progress[file_id] = {
+                'size': file_size,
+                'transferred': 0,
+                'start_time': time.time()
+            }
+    
+    def update_file(self, file_id, bytes_transferred):
+        """Update progress for a specific file."""
+        with self.lock:
+            if file_id in self.file_progress:
+                old_transferred = self.file_progress[file_id]['transferred']
+                self.file_progress[file_id]['transferred'] = bytes_transferred
+                
+                # Calculate speed based on this update
+                current_time = time.time()
+                time_delta = current_time - self.last_update_time
+                if time_delta > 0:
+                    bytes_delta = bytes_transferred - old_transferred
+                    speed = bytes_delta / time_delta
+                    self.speed_samples.append(speed)
+                
+                self.last_update_time = current_time
+    
+    def complete_file(self, file_id):
+        """Mark a file as completed."""
+        with self.lock:
+            if file_id in self.file_progress:
+                file_info = self.file_progress[file_id]
+                self.completed_files += 1
+                self.completed_size += file_info['size']
+                del self.file_progress[file_id]
+    
+    def get_stats(self):
+        """Get current transfer statistics."""
+        with self.lock:
+            # Calculate total transferred (completed + in-progress)
+            in_progress_size = sum(f['transferred'] for f in self.file_progress.values())
+            total_transferred = self.completed_size + in_progress_size
+            
+            # Calculate average speed from recent samples
+            avg_speed = sum(self.speed_samples) / len(self.speed_samples) if self.speed_samples else 0
+            
+            # If no recent samples, use overall average
+            if avg_speed == 0:
+                elapsed = time.time() - self.start_time
+                avg_speed = total_transferred / elapsed if elapsed > 0 else 0
+            
+            # Calculate ETA
+            remaining_size = self.total_size - total_transferred
+            eta_seconds = remaining_size / avg_speed if avg_speed > 0 else 0
+            
+            return {
+                'completed_files': self.completed_files,
+                'total_files': self.total_files,
+                'completed_size': total_transferred,
+                'total_size': self.total_size,
+                'speed': avg_speed,
+                'eta_seconds': eta_seconds,
+                'percentage': (total_transferred / self.total_size * 100) if self.total_size > 0 else 0
+            }
 
 def download_folder(
     client: Minio, 
@@ -67,15 +179,8 @@ def download_folder(
         print("No files to download")
         return True
     
-    # Set up progress tracking
-    total_files = len(download_files)
-    completed_files = 0
-    total_size = 0
-    completed_size = 0
-    lock = threading.Lock()
-    start_time = time.time()
-
     # Get total size of all files
+    total_size = 0
     for file_info in download_files:
         try:
             stat = client.stat_object(bucket_name, file_info['object_name'])
@@ -84,63 +189,91 @@ def download_folder(
         except S3Error as err:
             print(f"Error getting size for {file_info['object_name']}: {err}")
             return False
-
-    progress_configmap = {
-        "total_files": str(total_files),
-        "completed_files": "0",
-        "total_size": str(total_size),
-        "completed_size": "0",
-        "eta": "",
-        "status": "downloading"
-    }
+    
+    # Initialize progress tracking
+    progress = TransferProgress(len(download_files), total_size)
+    
+    # Progress display thread
+    def display_progress():
+        """Display progress updates periodically."""
+        while True:
+            stats = progress.get_stats()
+            if stats['completed_files'] == stats['total_files']:
+                break
+                
+            eta_seconds = stats['eta_seconds']
+            eta_min = int(eta_seconds // 60)
+            eta_sec = int(eta_seconds % 60)
+            
+            print(f"Progress: {stats['completed_files']}/{stats['total_files']} files "
+                  f"({stats['percentage']:.1f}%) - "
+                  f"Speed: {stats['speed']/1024/1024:.2f} MB/s - "
+                  f"ETA: {eta_min}m {eta_sec}s")
+            
+            # Update Kubernetes ConfigMap
+            progress_configmap = {
+                "total_files": str(stats['total_files']),
+                "completed_files": str(stats['completed_files']),
+                "total_size": str(stats['total_size']),
+                "completed_size": str(int(stats['completed_size'])),
+                "eta": str(eta_seconds),
+                "status": "downloading"
+            }
+            update_status(progress_configmap)
+            
+            time.sleep(1)
+    
+    # Start progress display thread
+    progress_thread = threading.Thread(target=display_progress)
+    progress_thread.daemon = True
+    progress_thread.start()
 
     def download_file(file_info):
-        nonlocal completed_files, completed_size
+        file_id = file_info['object_name']
         try:
-            client.fget_object(bucket_name, file_info['object_name'], file_info['file_path'])
-
-            with lock:
-                completed_files += 1
-                completed_size += file_info['size']
-                elapsed_time = time.time() - start_time
-                bytes_per_second = completed_size / elapsed_time if elapsed_time > 0 else 0
-                remaining_size = total_size - completed_size
-                eta_seconds = remaining_size / bytes_per_second if bytes_per_second > 0 else 0
-
-                eta_min = int(eta_seconds // 60)
-                eta_sec = int(eta_seconds % 60)
-
-                print(f"Progress: {completed_files}/{total_files} files "
-                      f"({(completed_size/total_size)*100:.1f}%) - "
-                      f"ETA: {eta_min}m {eta_sec}s - "
-                      f"Downloaded: {file_info['object_name']}")
-                
-                progress_configmap["completed_files"] = str(completed_files)
-                progress_configmap["completed_size"] = str(completed_size)
-                progress_configmap["eta"] = str(eta_seconds)
-                update_status(progress_configmap)
+            # Create progress callback for this file
+            progress_callback = ProgressCallback(progress, file_id)
+            
+            # Download with progress tracking
+            client.fget_object(
+                bucket_name, 
+                file_info['object_name'], 
+                file_info['file_path'],
+                progress=progress_callback
+            )
+            
+            # Mark file as completed
+            progress.complete_file(file_id)
+            print(f"Downloaded: {file_info['object_name']}")
             return True
+            
         except S3Error as err:
             print(f"Error downloading {file_info['object_name']}: {err}")
-            progress_configmap["status"] = "failed"
-            update_status(progress_configmap)
             return False
         
-    # Use ThreadPoolExecutor for parallel uploads
+    # Use ThreadPoolExecutor for parallel downloads
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = list(executor.map(download_file, download_files))
     
     success = all(results)
     
+    # Final status update
+    final_stats = progress.get_stats()
+    progress_configmap = {
+        "total_files": str(final_stats['total_files']),
+        "completed_files": str(final_stats['completed_files']),
+        "total_size": str(final_stats['total_size']),
+        "completed_size": str(int(final_stats['completed_size'])),
+        "eta": "0",
+        "status": "completed" if success else "failed"
+    }
+    update_status(progress_configmap)
+    
     if success:
         print("Download completed successfully!")
-        progress_configmap["status"] = "completed"
-        update_status(progress_configmap)
         return True
     else:
-        print(f"Failed to download {prefix} from store://{bucket_name}/{prefix}")
-        progress_configmap["status"] = "failed"
-        update_status(progress_configmap)
+        print(f"Failed to download some files from store://{bucket_name}/{prefix}")
         return False
 
 
@@ -180,15 +313,8 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
     
     print(f"Found {len(upload_files)} files to upload")
     
-    # Set up progress tracking
-    total_files = len(upload_files)
-    completed_files = 0
-    total_size = 0
-    completed_size = 0
-    lock = threading.Lock()
-    start_time = time.time()
-
     # Get total size of all files
+    total_size = 0
     for file_info in upload_files:
         try:
             file_size = os.path.getsize(file_info['file_path'])
@@ -197,50 +323,66 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
         except OSError as err:
             print(f"Error getting size for {file_info['file_path']}: {err}")
             return False
-
-    progress_configmap = {
-        "total_files": str(total_files),
-        "completed_files": "0",
-        "total_size": str(total_size),
-        "completed_size": "0",
-        "eta": "",
-        "status": "uploading"
-    }
+    
+    # Initialize progress tracking
+    progress = TransferProgress(len(upload_files), total_size)
+    
+    # Progress display thread
+    def display_progress():
+        """Display progress updates periodically."""
+        while True:
+            stats = progress.get_stats()
+            if stats['completed_files'] == stats['total_files']:
+                break
+                
+            eta_seconds = stats['eta_seconds']
+            eta_min = int(eta_seconds // 60)
+            eta_sec = int(eta_seconds % 60)
+            
+            print(f"Progress: {stats['completed_files']}/{stats['total_files']} files "
+                  f"({stats['percentage']:.1f}%) - "
+                  f"Speed: {stats['speed']/1024/1024:.2f} MB/s - "
+                  f"ETA: {eta_min}m {eta_sec}s")
+            
+            # Update Kubernetes ConfigMap
+            progress_configmap = {
+                "total_files": str(stats['total_files']),
+                "completed_files": str(stats['completed_files']),
+                "total_size": str(stats['total_size']),
+                "completed_size": str(int(stats['completed_size'])),
+                "eta": str(eta_seconds),
+                "status": "uploading"
+            }
+            update_status(progress_configmap)
+            
+            time.sleep(1)
+    
+    # Start progress display thread
+    progress_thread = threading.Thread(target=display_progress)
+    progress_thread.daemon = True
+    progress_thread.start()
     
     def upload_file(file_info):
-        nonlocal completed_files, completed_size
+        file_id = file_info['object_name']
         try:
+            # Create progress callback for this file
+            progress_callback = ProgressCallback(progress, file_id)
+            
+            # Upload with progress tracking
             client.fput_object(
                 bucket_name, 
                 file_info['object_name'], 
-                file_info['file_path']
+                file_info['file_path'],
+                progress=progress_callback
             )
             
-            with lock:
-                completed_files += 1
-                completed_size += file_info['size']
-                elapsed_time = time.time() - start_time
-                bytes_per_second = completed_size / elapsed_time if elapsed_time > 0 else 0
-                remaining_size = total_size - completed_size
-                eta_seconds = remaining_size / bytes_per_second if bytes_per_second > 0 else 0
-                
-                eta_min = int(eta_seconds // 60)
-                eta_sec = int(eta_seconds % 60)
-                
-                print(f"Progress: {completed_files}/{total_files} files "
-                      f"({(completed_size/total_size)*100:.1f}%) - "
-                      f"ETA: {eta_min}m {eta_sec}s - "
-                      f"Uploaded: {file_info['object_name']}")
-                
-                progress_configmap["completed_files"] = str(completed_files)
-                progress_configmap["completed_size"] = str(completed_size)
-                progress_configmap["eta"] = str(eta_seconds)
-                update_status(progress_configmap)
+            # Mark file as completed
+            progress.complete_file(file_id)
+            print(f"Uploaded: {file_info['object_name']}")
             return True
+            
         except S3Error as err:
             print(f"Error uploading {file_info['object_name']}: {err}")
-            progress_configmap["status"] = "failed"
-            update_status(progress_configmap)
             return False
     
     # Use ThreadPoolExecutor for parallel uploads
@@ -249,13 +391,21 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
     
     success = all(results)
     
+    # Final status update
+    final_stats = progress.get_stats()
+    progress_configmap = {
+        "total_files": str(final_stats['total_files']),
+        "completed_files": str(final_stats['completed_files']),
+        "total_size": str(final_stats['total_size']),
+        "completed_size": str(int(final_stats['completed_size'])),
+        "eta": "0",
+        "status": "completed" if success else "failed"
+    }
+    update_status(progress_configmap)
+    
     if success:
         print("Upload completed successfully!")
-        progress_configmap["status"] = "completed"
-        update_status(progress_configmap)
         return True
     else:
         print(f"Failed to upload some files to store://{bucket_name}/{prefix}")
-        progress_configmap["status"] = "failed"
-        update_status(progress_configmap)
         return False
