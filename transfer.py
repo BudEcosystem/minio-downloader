@@ -46,6 +46,8 @@ class TransferProgress:
         self.total_size = total_size
         self.completed_files = 0
         self.completed_size = 0
+        self.skipped_files = 0
+        self.skipped_size = 0
         self.lock = threading.Lock()
         self.start_time = time.time()
         
@@ -91,33 +93,85 @@ class TransferProgress:
                 self.completed_size += file_info['size']
                 del self.file_progress[file_id]
     
+    def skip_file(self, file_id, file_size):
+        """Mark a file as skipped (already exists locally with same size)."""
+        with self.lock:
+            self.completed_files += 1
+            self.completed_size += file_size
+            self.skipped_files += 1
+            self.skipped_size += file_size
+            # Remove from file_progress if it was added
+            if file_id in self.file_progress:
+                del self.file_progress[file_id]
+    
     def get_stats(self):
         """Get current transfer statistics."""
         with self.lock:
             # Calculate total transferred (completed + in-progress)
             in_progress_size = sum(f['transferred'] for f in self.file_progress.values())
-            total_transferred = self.completed_size + in_progress_size
+            # Ensure total_transferred doesn't exceed total_size
+            total_transferred = min(self.completed_size + in_progress_size, self.total_size)
+            
+            # Calculate both file and byte percentages
+            file_percentage = (self.completed_files / self.total_files * 100) if self.total_files > 0 else 0
+            byte_percentage = (total_transferred / self.total_size * 100) if self.total_size > 0 else 0
+            
+            # Use file percentage when bytes are complete but files remain
+            if byte_percentage >= 100.0 and self.completed_files < self.total_files:
+                display_percentage = file_percentage
+            else:
+                display_percentage = byte_percentage
             
             # Calculate average speed from recent samples
             avg_speed = sum(self.speed_samples) / len(self.speed_samples) if self.speed_samples else 0
             
-            # If no recent samples, use overall average
+            # If no recent samples, use overall average (excluding skipped files)
             if avg_speed == 0:
                 elapsed = time.time() - self.start_time
-                avg_speed = total_transferred / elapsed if elapsed > 0 else 0
+                actual_transferred = total_transferred - self.skipped_size
+                avg_speed = actual_transferred / elapsed if elapsed > 0 and actual_transferred > 0 else 0
             
             # Calculate ETA
             remaining_size = self.total_size - total_transferred
-            eta_seconds = remaining_size / avg_speed if avg_speed > 0 else 0
+            eta_seconds = remaining_size / avg_speed if avg_speed > 0 and remaining_size > 0 else 0
+            
+            # When all bytes are transferred but files remain, always use file-based ETA
+            if total_transferred >= self.total_size and self.completed_files < self.total_files:
+                elapsed = time.time() - self.start_time
+                # Use a conservative estimate for remaining files
+                if elapsed > 0:
+                    if self.completed_files > self.skipped_files:
+                        # Calculate based on actually downloaded files
+                        downloaded_files = self.completed_files - self.skipped_files
+                        files_per_second = downloaded_files / elapsed if downloaded_files > 0 else 0.1
+                    else:
+                        # All files so far were skipped, use a conservative estimate
+                        files_per_second = self.completed_files / elapsed if self.completed_files > 0 else 0.1
+                    
+                    remaining_files = self.total_files - self.completed_files
+                    eta_seconds = remaining_files / files_per_second if files_per_second > 0 else 0
+            
+            # Additional fallback: if no bytes transferred yet but files are being processed
+            elif eta_seconds == 0 and self.completed_files < self.total_files:
+                elapsed = time.time() - self.start_time
+                if elapsed > 0 and self.completed_files > 0:
+                    files_per_second = self.completed_files / elapsed
+                    remaining_files = self.total_files - self.completed_files
+                    eta_seconds = remaining_files / files_per_second if files_per_second > 0 else 0
             
             return {
                 'completed_files': self.completed_files,
                 'total_files': self.total_files,
                 'completed_size': total_transferred,
                 'total_size': self.total_size,
+                'skipped_files': self.skipped_files,
+                'skipped_size': self.skipped_size,
+                'downloaded_files': self.completed_files - self.skipped_files,
                 'speed': avg_speed,
                 'eta_seconds': eta_seconds,
-                'percentage': (total_transferred / self.total_size * 100) if self.total_size > 0 else 0
+                'percentage': display_percentage,
+                'file_percentage': file_percentage,
+                'byte_percentage': byte_percentage
             }
 
 def download_folder(
@@ -205,8 +259,28 @@ def download_folder(
             eta_min = int(eta_seconds // 60)
             eta_sec = int(eta_seconds % 60)
             
-            print(f"Progress: {stats['completed_files']}/{stats['total_files']} files "
-                  f"({stats['percentage']:.1f}%) - "
+            # Build progress info with downloaded and skipped counts
+            downloaded = stats['downloaded_files']
+            skipped = stats['skipped_files']
+            
+            # Show file-based or byte-based percentage depending on the situation
+            if stats['byte_percentage'] >= 100.0 and stats['completed_files'] < stats['total_files']:
+                # Bytes complete but files remain - show file percentage
+                percent_info = f"{stats['file_percentage']:.1f}% files"
+                status_msg = "Finalizing"
+            else:
+                percent_info = f"{stats['percentage']:.1f}%"
+                status_msg = "Progress"
+            
+            # Format the progress message
+            files_info = f"{stats['completed_files']}/{stats['total_files']} files"
+            if downloaded > 0 or skipped > 0:
+                files_info += f" ({downloaded} new"
+                if skipped > 0:
+                    files_info += f", {skipped} skipped"
+                files_info += ")"
+            
+            print(f"{status_msg}: {files_info} - {percent_info} - "
                   f"Speed: {stats['speed']/1024/1024:.2f} MB/s - "
                   f"ETA: {eta_min}m {eta_sec}s")
             
@@ -230,6 +304,18 @@ def download_folder(
 
     def download_file(file_info):
         file_id = file_info['object_name']
+        
+        # Check if file already exists with matching size
+        if os.path.exists(file_info['file_path']):
+            local_size = os.path.getsize(file_info['file_path'])
+            if local_size == file_info['size']:
+                # File exists with correct size, skip download
+                progress.skip_file(file_id, file_info['size'])
+                print(f"Skipped (exists): {file_info['object_name']}")
+                return True
+            else:
+                print(f"Re-downloading (size mismatch): {file_info['object_name']} (local: {local_size}, remote: {file_info['size']})")
+        
         try:
             # Create progress callback for this file
             progress_callback = ProgressCallback(progress, file_id)
@@ -339,8 +425,28 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
             eta_min = int(eta_seconds // 60)
             eta_sec = int(eta_seconds % 60)
             
-            print(f"Progress: {stats['completed_files']}/{stats['total_files']} files "
-                  f"({stats['percentage']:.1f}%) - "
+            # Build progress info with downloaded and skipped counts
+            downloaded = stats['downloaded_files']
+            skipped = stats['skipped_files']
+            
+            # Show file-based or byte-based percentage depending on the situation
+            if stats['byte_percentage'] >= 100.0 and stats['completed_files'] < stats['total_files']:
+                # Bytes complete but files remain - show file percentage
+                percent_info = f"{stats['file_percentage']:.1f}% files"
+                status_msg = "Finalizing"
+            else:
+                percent_info = f"{stats['percentage']:.1f}%"
+                status_msg = "Progress"
+            
+            # Format the progress message
+            files_info = f"{stats['completed_files']}/{stats['total_files']} files"
+            if downloaded > 0 or skipped > 0:
+                files_info += f" ({downloaded} new"
+                if skipped > 0:
+                    files_info += f", {skipped} skipped"
+                files_info += ")"
+            
+            print(f"{status_msg}: {files_info} - {percent_info} - "
                   f"Speed: {stats['speed']/1024/1024:.2f} MB/s - "
                   f"ETA: {eta_min}m {eta_sec}s")
             
@@ -364,6 +470,21 @@ def upload_folder(client: Minio, bucket_name: str, prefix: str, local_destinatio
     
     def upload_file(file_info):
         file_id = file_info['object_name']
+        
+        # Check if file already exists in MinIO with matching size
+        try:
+            stat = client.stat_object(bucket_name, file_info['object_name'])
+            if stat.size == file_info['size']:
+                # File exists with correct size, skip upload
+                progress.skip_file(file_id, file_info['size'])
+                print(f"Skipped (exists): {file_info['object_name']}")
+                return True
+            else:
+                print(f"Re-uploading (size mismatch): {file_info['object_name']} (remote: {stat.size}, local: {file_info['size']})")
+        except S3Error:
+            # File doesn't exist in MinIO, proceed with upload
+            pass
+        
         try:
             # Create progress callback for this file
             progress_callback = ProgressCallback(progress, file_id)
