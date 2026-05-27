@@ -10,6 +10,7 @@ Covers the contract that PR A introduces:
   * The "interrupted" terminal status is reported when SIGTERM fires.
 """
 
+import json
 import os
 import tempfile
 import threading
@@ -153,6 +154,128 @@ class SkipIfAlreadyOnDiskTests(unittest.TestCase):
                 fh.write(b"x" * 50)
             progress = TransferProgress(1, 100)
             self.assertFalse(_maybe_skip(task, progress))
+
+    def test_etag_mismatch_triggers_redownload(self):
+        """Server published new content at the same byte length: the
+        existing local file + stale sidecar must be discarded, not
+        silently promoted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            content = b"stale-bytes"
+            task = _make_task(tmp, content)  # etag = "deadbeef"
+            with open(task.final_path, "wb") as fh:
+                fh.write(content)
+            # Sidecar records a DIFFERENT etag from task.etag.
+            with open(task.sidecar_path, "w") as fh:
+                json.dump({"etag": "feedface", "size": task.size}, fh)
+
+            progress = TransferProgress(1, len(content))
+            self.assertFalse(_maybe_skip(task, progress))
+            # Stale artefacts should be gone so the re-download starts clean.
+            self.assertFalse(os.path.exists(task.final_path))
+            self.assertFalse(os.path.exists(task.sidecar_path))
+
+
+class RetryRollbackTests(unittest.TestCase):
+    """Verify that a tenacity-style retry inside _ranged_stream_to_fd does
+    not double-count progress: bytes streamed before a transient failure
+    must be subtracted before the next attempt re-streams the same range."""
+
+    def test_progress_does_not_double_count_on_retry(self):
+        from urllib3.exceptions import ProtocolError
+
+        from transfer import _ranged_stream_to_fd
+
+        content = b"abcdefghij" * 10  # 100 bytes
+
+        class _FlakyClient:
+            """First attempt: stream succeeds for 30 bytes then raises.
+            Second attempt: streams the full range cleanly."""
+
+            def __init__(self):
+                self.attempts = 0
+
+            def get_object(self, bucket, key, offset=0, length=0):
+                self.attempts += 1
+                slice_bytes = content[offset : offset + length]
+                if self.attempts == 1:
+                    return _flaky_response(slice_bytes, fail_after=30)
+                return _fake_object(slice_bytes)
+
+        def _flaky_response(payload: bytes, fail_after: int):
+            response = MagicMock()
+
+            def _stream(_chunk_size=None):
+                # Yield deliberately small chunks (independent of the
+                # caller-requested chunk size) so we cross fail_after
+                # mid-stream regardless of STREAM_CHUNK_BYTES.
+                streamed = 0
+                step = 20
+                for i in range(0, len(payload), step):
+                    if streamed >= fail_after:
+                        raise ProtocolError("simulated mid-stream drop")
+                    chunk = payload[i : i + step]
+                    yield chunk
+                    streamed += len(chunk)
+
+            response.stream = _stream
+            response.close = MagicMock()
+            response.release_conn = MagicMock()
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            part_path = os.path.join(tmp, "obj.part")
+            fd = os.open(part_path, os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                progress = TransferProgress(1, len(content))
+                progress.start_file("obj", len(content))
+                client = _FlakyClient()
+                _ranged_stream_to_fd(
+                    client,
+                    "bucket",
+                    "obj",
+                    offset=0,
+                    length=len(content),
+                    write_at=0,
+                    fd=fd,
+                    progress=progress,
+                    file_id="obj",
+                    shutdown=threading.Event(),
+                )
+            finally:
+                os.close(fd)
+
+            stats = progress.get_stats()
+            # `transferred` after a successful run should exactly equal the
+            # number of bytes streamed once.  If the retry double-counted,
+            # `completed_size` would still be clamped (min with total_size),
+            # but the in-progress entry exposes the raw count.
+            with progress.lock:
+                self.assertIn("obj", progress.file_progress)
+                self.assertEqual(
+                    progress.file_progress["obj"]["transferred"], len(content)
+                )
+            # Two GETs total: 1 failed mid-stream + 1 retry.
+            self.assertEqual(client.attempts, 2)
+            # `.part` should hold the correct bytes.
+            with open(part_path, "rb") as fh:
+                self.assertEqual(fh.read(), content)
+
+
+class ZeroByteTests(unittest.TestCase):
+    def test_singlestream_handles_zero_byte_file(self):
+        """Empty source objects must produce an empty .part file so
+        _finalize can rename it without raising FileNotFoundError."""
+        from transfer import _download_singlestream
+
+        with tempfile.TemporaryDirectory() as tmp:
+            task = _make_task(tmp, b"")
+            client = _FakeMinio(b"")
+            progress = TransferProgress(1, 0)
+            _download_singlestream(client, "bucket", task, progress, threading.Event())
+            self.assertTrue(os.path.exists(task.part_path))
+            self.assertEqual(os.path.getsize(task.part_path), 0)
+            # No GET should have been issued for a zero-byte file.
+            self.assertEqual(client.get_calls, [])
 
 
 class SingleStreamResumeTests(unittest.TestCase):

@@ -44,12 +44,6 @@ from typing import Iterable, Optional
 
 from minio import Minio
 from minio.error import S3Error
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 from urllib3.exceptions import HTTPError, ProtocolError
 
 from status import flush_status, update_status
@@ -322,9 +316,37 @@ def _save_idx(idx_path: str, done: set) -> None:
 
 
 def _allocate_part(part_path: str, size: int) -> None:
-    """Create part_path as a sparse file of exactly `size` bytes."""
-    with open(part_path, "ab+") as fh:
-        fh.truncate(size)
+    """Create part_path as a sparse file of exactly `size` bytes.
+
+    Uses os.open + ftruncate so behaviour is consistent across Linux / NFS
+    backends and we don't depend on Python's append-mode quirks.  Existing
+    contents (e.g. a previous run's partial bytes) are preserved by
+    ftruncate when `size` >= current file length.
+    """
+    fd = os.open(part_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+
+
+def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
+    """Write ``data`` at ``offset`` via pwrite, handling short writes.
+
+    POSIX pwrite() can legally return fewer bytes than requested (NFS,
+    EINTR, signal delivery between syscalls).  The original code assumed
+    one call always wrote everything, which silently produced misaligned
+    `.part` files on backends that short-write.
+    """
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        n = os.pwrite(fd, view[written:], offset + written)
+        if n <= 0:
+            raise IOError(
+                f"pwrite returned {n} for {len(view) - written} bytes at offset {offset + written}"
+            )
+        written += n
 
 
 # ---------------------------------------------------------------------------
@@ -332,12 +354,6 @@ def _allocate_part(part_path: str, size: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(NETWORK_RETRY_ATTEMPTS),
-    wait=wait_exponential(multiplier=1, min=1, max=16),
-    retry=retry_if_exception_type(_RETRYABLE_EXC),
-)
 def _ranged_stream_to_fd(
     client: Minio,
     bucket: str,
@@ -352,23 +368,75 @@ def _ranged_stream_to_fd(
 ) -> None:
     """Download bytes [offset, offset+length) and pwrite them at `write_at`.
 
-    Retried as a whole unit on transient network errors via tenacity.  Each
-    1 MiB chunk re-checks `shutdown` so a SIGTERM unwinds quickly.
+    Implements its own retry loop (rather than ``@tenacity.retry``) so it
+    can subtract the partial bytes counted on a failed attempt from
+    ``progress``.  Without this correction, every retry double-counts the
+    chunks that streamed before the disconnect, inflating ETA/speed and
+    pushing per-file `transferred` past the file size.
     """
-    response = client.get_object(bucket, key, offset=offset, length=length)
-    try:
-        cursor = write_at
-        for chunk in response.stream(STREAM_CHUNK_BYTES):
-            if shutdown.is_set():
+    backoff = 1.0
+    max_attempts = max(1, NETWORK_RETRY_ATTEMPTS)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        if shutdown.is_set():
+            raise InterruptedError("shutdown requested")
+        bytes_streamed = 0
+        response = None
+        try:
+            response = client.get_object(bucket, key, offset=offset, length=length)
+            cursor = write_at
+            for chunk in response.stream(STREAM_CHUNK_BYTES):
+                if shutdown.is_set():
+                    raise InterruptedError("shutdown requested")
+                if not chunk:
+                    continue
+                _pwrite_all(fd, chunk, cursor)
+                cursor += len(chunk)
+                bytes_streamed += len(chunk)
+                progress.add_file_bytes(file_id, len(chunk))
+            return
+        except InterruptedError:
+            raise
+        except _RETRYABLE_EXC as exc:
+            last_exc = exc
+            # Roll back this attempt's contribution to progress so the
+            # retry doesn't double-count bytes that streamed before the
+            # disconnect.  Speed samples only inflate on positive deltas
+            # (see TransferProgress.add_file_bytes), so a negative rollback
+            # corrects `transferred` without touching the EMA.
+            if bytes_streamed:
+                progress.add_file_bytes(file_id, -bytes_streamed)
+            if attempt >= max_attempts:
+                raise
+            print(
+                f"[retry] {key} offset={offset} attempt {attempt}/{max_attempts} "
+                f"after {type(exc).__name__}: {exc}; sleeping {backoff:.1f}s"
+            )
+            # Honour shutdown during the backoff sleep.
+            if shutdown.wait(timeout=backoff):
                 raise InterruptedError("shutdown requested")
-            if not chunk:
-                continue
-            os.pwrite(fd, chunk, cursor)
-            cursor += len(chunk)
-            progress.add_file_bytes(file_id, len(chunk))
-    finally:
-        response.close()
-        response.release_conn()
+            backoff = min(backoff * 2, 16.0)
+        except Exception:
+            # Non-retryable: drop the bytes from progress for consistency
+            # and bubble up so the caller can decide.
+            if bytes_streamed:
+                progress.add_file_bytes(file_id, -bytes_streamed)
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                try:
+                    response.release_conn()
+                except Exception:
+                    pass
+
+    # Defensive: should be unreachable because the loop either returns,
+    # re-raises last_exc on the final attempt, or raises a non-retryable.
+    if last_exc is not None:
+        raise last_exc
 
 
 def _resume_offset_for_singlestream(part_path: str, server_size: int) -> int:
@@ -388,9 +456,28 @@ def _download_singlestream(
     progress: TransferProgress,
     shutdown: threading.Event,
 ) -> None:
-    """Streaming, resumable download for files below the multipart threshold."""
-    offset = _resume_offset_for_singlestream(task.part_path, task.size)
+    """Streaming, resumable download for files below the multipart threshold.
+
+    Handles three regimes:
+
+    * task.size == 0: create an empty `.part` so `_finalize` can rename it
+      without crashing on a missing path.
+    * resume: existing `.part` smaller than the server size → GET only the
+      tail with a Range header.
+    * fresh: no `.part` → GET the whole file.
+    """
     progress.start_file(task.file_id, task.size)
+
+    # Zero-byte object: just touch the .part file and we're done.  Without
+    # this branch _download_one's os.path.getsize(task.part_path) below
+    # raises FileNotFoundError for any empty object in the registry.
+    if task.size == 0:
+        os.makedirs(os.path.dirname(task.part_path), exist_ok=True)
+        fd = os.open(task.part_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.close(fd)
+        return
+
+    offset = _resume_offset_for_singlestream(task.part_path, task.size)
     if offset > 0:
         progress.add_file_bytes(task.file_id, offset)
 
@@ -422,7 +509,24 @@ def _download_multipart(
     progress: TransferProgress,
     shutdown: threading.Event,
 ) -> None:
-    """Parallel ranged GETs into a single pre-allocated .part file."""
+    """Parallel ranged GETs into a single pre-allocated .part file.
+
+    We fsync the fd in the `finally:` clause so partial work done before
+    a sibling worker raises is durable on disk.  Without this, a worker
+    that completed its chunk (and persisted its offset to `.part.idx`)
+    can have its bytes still sitting in the page cache when another
+    worker fails — a subsequent node crash would then read `.idx` saying
+    the offset is done while the on-disk bytes are stale.
+    """
+    progress.start_file(task.file_id, task.size)
+
+    # Zero-byte object: handled by the singlestream path, but guard anyway.
+    if task.size == 0:
+        os.makedirs(os.path.dirname(task.part_path), exist_ok=True)
+        fd = os.open(task.part_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.close(fd)
+        return
+
     os.makedirs(os.path.dirname(task.part_path), exist_ok=True)
     _allocate_part(task.part_path, task.size)
 
@@ -439,7 +543,6 @@ def _download_multipart(
     valid_offsets = {start for start, _ in parts}
     done = _load_idx(task.idx_path) & valid_offsets
 
-    progress.start_file(task.file_id, task.size)
     already = sum(length for offset, length in parts if offset in done)
     if already:
         progress.add_file_bytes(task.file_id, already)
@@ -449,25 +552,33 @@ def _download_multipart(
         return
 
     idx_lock = threading.Lock()
+    # Signal so a single worker failure causes the others to abort
+    # promptly instead of finishing pointless work.  Distinct from the
+    # global shutdown event (which signals SIGTERM).
+    file_abort = threading.Event()
     fd = os.open(task.part_path, os.O_WRONLY, 0o644)
     try:
 
         def _do_part(offset_length):
             offset, length = offset_length
-            if shutdown.is_set():
-                raise InterruptedError("shutdown requested")
-            _ranged_stream_to_fd(
-                client,
-                bucket,
-                task.object_name,
-                offset=offset,
-                length=length,
-                write_at=offset,
-                fd=fd,
-                progress=progress,
-                file_id=task.file_id,
-                shutdown=shutdown,
-            )
+            if shutdown.is_set() or file_abort.is_set():
+                raise InterruptedError("shutdown or sibling-failure abort")
+            try:
+                _ranged_stream_to_fd(
+                    client,
+                    bucket,
+                    task.object_name,
+                    offset=offset,
+                    length=length,
+                    write_at=offset,
+                    fd=fd,
+                    progress=progress,
+                    file_id=task.file_id,
+                    shutdown=shutdown,
+                )
+            except Exception:
+                file_abort.set()
+                raise
             with idx_lock:
                 done.add(offset)
                 _save_idx(task.idx_path, done)
@@ -475,38 +586,93 @@ def _download_multipart(
         workers = min(INTRAFILE_WORKERS, len(pending))
         with ThreadPoolExecutor(max_workers=workers) as inner:
             futures = [inner.submit(_do_part, p) for p in pending]
+            # Drain every future so we re-raise on the first failure but
+            # also wait for siblings to unwind cleanly (the abort event
+            # makes them exit fast).
+            first_exc: Optional[BaseException] = None
             for fut in futures:
-                fut.result()  # re-raise any exception
-        os.fsync(fd)
+                try:
+                    fut.result()
+                except BaseException as exc:
+                    if first_exc is None:
+                        first_exc = exc
+                    file_abort.set()
+            if first_exc is not None:
+                raise first_exc
     finally:
+        # fsync any work that landed (even if we're unwinding via an
+        # exception).  Persisting now means the `.part.idx` entries that
+        # were saved before the failure remain truthful for the next
+        # resume attempt.
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
         os.close(fd)
 
 
 def _finalize(task: FileTask) -> None:
-    """Atomically promote .part → final, write etag sidecar, clean up .idx."""
-    os.replace(task.part_path, task.final_path)
-    _write_sidecar(task.sidecar_path, task.etag, task.size)
+    """Atomically promote .part → final, write etag sidecar, clean up .idx.
+
+    We remove the `.idx` file BEFORE the rename so a crash between rename
+    and sidecar-write doesn't leave an orphaned idx referencing offsets
+    that no longer make sense for the finalised file.
+    """
     if os.path.exists(task.idx_path):
         try:
             os.remove(task.idx_path)
         except OSError:
             pass
+    os.replace(task.part_path, task.final_path)
+    _write_sidecar(task.sidecar_path, task.etag, task.size)
 
 
 def _maybe_skip(task: FileTask, progress: TransferProgress) -> bool:
-    """Idempotency check: return True if the file is already complete on disk."""
+    """Idempotency check: return True if the file is already complete on disk.
+
+    Decision matrix when ``final_path`` exists with matching size:
+
+    * sidecar matches server etag → skip (the canonical happy path).
+    * sidecar missing → trust the size match, write the sidecar, and skip.
+      This handles legacy files that pre-date the etag-tracking scheme.
+    * sidecar present but etag MISMATCHES → re-download.  Treating a
+      mismatch as 'just promote' would silently ship stale bytes to the
+      runtime when the source object was replaced with new content that
+      happens to have the same length (re-trained weights, partial
+      corruption that preserved size, etc.).
+    """
     if not os.path.exists(task.final_path):
         return False
     local_size = os.path.getsize(task.final_path)
     if local_size != task.size:
         return False
-    # Size matches.  Promote sidecar if missing so future runs short-circuit
-    # without re-checking.
-    if not _sidecar_matches(task.sidecar_path, task.etag, task.size):
-        try:
-            _write_sidecar(task.sidecar_path, task.etag, task.size)
-        except OSError:
-            pass
+
+    if _sidecar_matches(task.sidecar_path, task.etag, task.size):
+        progress.skip_file(task.file_id, task.size)
+        return True
+
+    if os.path.exists(task.sidecar_path):
+        # Sidecar exists and disagrees with the server: cannot trust the
+        # on-disk file.  Tear it down and let the caller re-download.
+        print(f"[stale] {task.object_name}: local etag != server; re-downloading")
+        for stale in (
+            task.final_path,
+            task.sidecar_path,
+            task.part_path,
+            task.idx_path,
+        ):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        return False
+
+    # Sidecar absent — legacy or first-run promotion.  Trust size, write
+    # the sidecar so future runs hit the fast path.
+    try:
+        _write_sidecar(task.sidecar_path, task.etag, task.size)
+    except OSError:
+        pass
     progress.skip_file(task.file_id, task.size)
     return True
 
@@ -675,6 +841,28 @@ def download_folder(
         return True
 
     total_size = sum(t.size for t in tasks)
+    # Refuse to silently "succeed" when every planned object is zero-byte
+    # but there are objects listed.  This is almost always a sign of a
+    # listing edge case (multipart uploads in progress, placeholder markers,
+    # bad pagination) and would otherwise produce a deployment with no
+    # model weights on the PVC.
+    if total_size == 0 and any(t.size == 0 for t in tasks):
+        zero_files = [t.object_name for t in tasks if t.size == 0]
+        print(
+            f"[plan] WARN: all {len(zero_files)} planned objects are zero-byte "
+            f"— refusing to declare success; sample: {zero_files[:3]}"
+        )
+        flush_status(
+            status="failed",
+            total_files=len(tasks),
+            completed_files=0,
+            total_size=0,
+            completed_size=0,
+            eta=0,
+            reason="all listed objects are zero-byte",
+        )
+        return False
+
     print(f"[plan] {len(tasks)} files, {total_size / 1024 / 1024:.1f} MiB total")
 
     progress = TransferProgress(len(tasks), total_size)

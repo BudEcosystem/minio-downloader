@@ -33,6 +33,13 @@ _lock = threading.Lock()
 _last_written: dict | None = None
 _k8s_client: client.CoreV1Api | None = None
 _k8s_client_lock = threading.Lock()
+# Once `flush_status` writes a terminal payload (completed / failed /
+# interrupted), block any further `update_status` calls.  The progress
+# thread may still be parked in a slow `replace_namespaced_config_map`
+# call when the worker pool returns; without this guard, a stale
+# "downloading" write can land AFTER the terminal status, and the
+# budcluster polling workflow then never receives completion.
+_terminated = threading.Event()
 
 
 def _get_client() -> client.CoreV1Api:
@@ -92,10 +99,15 @@ def update_status(configmap: dict) -> None:
     """Write progress to the ConfigMap, skipping when nothing changed.
 
     Safe to call at high frequency — duplicates are dropped without an API call.
+    Returns immediately once `flush_status` has emitted a terminal payload,
+    so a slow in-flight progress write can't overwrite the terminal status.
     """
     global _last_written
 
     if not _enabled():
+        return
+
+    if _terminated.is_set():
         return
 
     namespace = os.environ.get("NAMESPACE")
@@ -106,10 +118,17 @@ def update_status(configmap: dict) -> None:
     payload = {k: str(v) for k, v in configmap.items()}
 
     with _lock:
+        if _terminated.is_set():
+            # Re-check inside the lock: flush_status may have fired while
+            # we were waiting.
+            return
         if _last_written == payload:
             return
         if _write(payload, namespace, configmap_name):
             _last_written = payload
+
+
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
 
 
 def flush_status(**fields) -> bool:
@@ -117,13 +136,18 @@ def flush_status(**fields) -> bool:
 
     Use this from signal handlers and just before process exit so that the
     final state (completed / failed / interrupted) is durable even if it is
-    bit-equal to the previous write.
+    bit-equal to the previous write.  Once a terminal status has been
+    written, subsequent ``update_status`` calls become no-ops so a slow
+    progress-thread write can't clobber the terminal payload.
     """
     global _last_written
 
+    payload_status = str(fields.get("status", "")).lower()
     if not _enabled():
         for k, v in fields.items():
             print(f"[status:{k}] {v}")
+        if payload_status in _TERMINAL_STATUSES:
+            _terminated.set()
         return True
 
     namespace = os.environ.get("NAMESPACE")
@@ -136,4 +160,9 @@ def flush_status(**fields) -> bool:
         ok = _write(payload, namespace, configmap_name)
         if ok:
             _last_written = payload
+        if payload_status in _TERMINAL_STATUSES:
+            # Set even on a partial-success write; if the write failed we
+            # don't want a steady-state progress thread to keep retrying
+            # over the top of an in-progress flush either.
+            _terminated.set()
         return ok
